@@ -58,10 +58,10 @@ index dab8d39..b62da79 100644
      }
  }
 diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/OkHttpRequestHook.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/OkHttpRequestHook.java
-index b18a63d..9bf9665 100644
+index b18a63d..278967d 100644
 --- a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/OkHttpRequestHook.java
 +++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/OkHttpRequestHook.java
-@@ -15,6 +15,7 @@ import app.morphe.extension.boostforreddit.http.reddit.RedditFixAudioInDownloads
+@@ -15,10 +15,12 @@ import app.morphe.extension.boostforreddit.http.reddit.RedditFixAudioInDownloads
  import app.morphe.extension.boostforreddit.http.reddit.RedditMediaUndeleteInterceptor;
  import app.morphe.extension.boostforreddit.http.reddit.RedditSubmissionUndeleteInterceptor;
  import app.morphe.extension.boostforreddit.http.reddit.RedditSubredditUndeleteInterceptor;
@@ -69,7 +69,20 @@ index b18a63d..9bf9665 100644
  import app.morphe.extension.boostforreddit.http.wayback.WaybackThrottlingInterceptor;
  import app.morphe.extension.shared.fixes.feed.RAllPatch;
  import app.morphe.extension.shared.requests.BaseOkHttpRequestHook;
-@@ -37,6 +38,7 @@ public class OkHttpRequestHook extends BaseOkHttpRequestHook {
+ import okhttp3.Interceptor;
++import okhttp3.OkHttpClient;
+ 
+ 
+ /**
+@@ -34,9 +36,15 @@ public class OkHttpRequestHook extends BaseOkHttpRequestHook {
+     }
+ 
+ 
++    @Override
++    protected void configureBuilder(OkHttpClient.Builder builder) {
++        ReuseHttpConnectionsPatch.configureBuilder(builder);
++    }
++
      @Override
      protected List<Interceptor> getInterceptors() {
          return List.of(
@@ -77,6 +90,52 @@ index b18a63d..9bf9665 100644
                  new RedditMediaUndeleteInterceptor(),
                  new RedditSubmissionUndeleteInterceptor(),
                  new RedditSubredditUndeleteInterceptor(),
+diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch.java
+new file mode 100644
+index 0000000..823a2f5
+--- /dev/null
++++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch.java
+@@ -0,0 +1,40 @@
++package app.morphe.extension.boostforreddit.http;
++
++import androidx.annotation.NonNull;
++
++import java.util.concurrent.TimeUnit;
++
++import app.morphe.extension.shared.Logger;
++import okhttp3.ConnectionPool;
++import okhttp3.OkHttpClient;
++
++/**
++ * Boost builds its central OkHttp client with {@code ConnectionPool(0, 1, NANOSECONDS)},
++ * which forbids idle connections entirely: every request pays a fresh TCP + TLS handshake,
++ * including media fetches, thumbnails, and the video player's requests. Restoring a standard
++ * pool lets OkHttp reuse connections; stale ones are retried automatically
++ * ({@code retryOnConnectionFailure} is on by default).
++ *
++ * <p>Only active when the "Reuse HTTP connections" patch is selected —
++ * {@link #isPatchIncluded()} is rewritten to return true by the patch.
++ */
++public class ReuseHttpConnectionsPatch {
++    private static final int MAX_IDLE_CONNECTIONS = 5;
++    private static final long KEEP_ALIVE_MINUTES = 5;
++
++    public static boolean isPatchIncluded() {
++        // Overridden by patch.
++        return false;
++    }
++
++    public static void configureBuilder(@NonNull OkHttpClient.Builder builder) {
++        if (!isPatchIncluded()) {
++            return;
++        }
++        builder.connectionPool(new ConnectionPool(
++                MAX_IDLE_CONNECTIONS, KEEP_ALIVE_MINUTES, TimeUnit.MINUTES));
++        Logger.printDebug(() -> "Restored shared connection pool on OkHttp builder");
++    }
++
++    private ReuseHttpConnectionsPatch() {}
++}
 diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/redgifs/RedgifsUrlSanitizerInterceptor.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/redgifs/RedgifsUrlSanitizerInterceptor.java
 new file mode 100644
 index 0000000..725a117
@@ -395,3 +454,71 @@ index af211dd..d6930bb 100644
          }
      }
  
+diff --git a/extensions/shared/library/src/main/java/app/morphe/extension/shared/requests/BaseOkHttpRequestHook.java b/extensions/shared/library/src/main/java/app/morphe/extension/shared/requests/BaseOkHttpRequestHook.java
+index 7b8b2ec..fbdfcd1 100644
+--- a/extensions/shared/library/src/main/java/app/morphe/extension/shared/requests/BaseOkHttpRequestHook.java
++++ b/extensions/shared/library/src/main/java/app/morphe/extension/shared/requests/BaseOkHttpRequestHook.java
+@@ -24,7 +24,16 @@ public abstract class BaseOkHttpRequestHook {
+     protected abstract List<Interceptor> getInterceptors();
+     protected abstract List<Interceptor> getNetworkInterceptors();
+ 
++    /**
++     * Hook for app-specific builder adjustments (timeouts, connection pool, ...).
++     * Default is a no-op.
++     */
++    protected void configureBuilder(OkHttpClient.Builder builder) {
++    }
++
+     public static OkHttpClient.Builder installInterceptor(OkHttpClient.Builder builder) {
++        INSTANCE.configureBuilder(builder);
++
+         for (Interceptor interceptor : INSTANCE.getInterceptors()) {
+             builder.addInterceptor(interceptor);
+         }
+diff --git a/patches/api/patches.api b/patches/api/patches.api
+index a4fb681..870c709 100644
+--- a/patches/api/patches.api
++++ b/patches/api/patches.api
+@@ -106,6 +106,10 @@ public final class app/morphe/patches/reddit/customclients/boostforreddit/http/i
+ 	public static final fun getInterceptImgurRequests ()Lapp/morphe/patcher/patch/BytecodePatch;
+ }
+ 
++public final class app/morphe/patches/reddit/customclients/boostforreddit/http/pool/ReuseHttpConnectionsPatchKt {
++	public static final fun getReuseHttpConnections ()Lapp/morphe/patcher/patch/BytecodePatch;
++}
++
+ public final class app/morphe/patches/reddit/customclients/boostforreddit/http/reddit/UndeleteRedditPatchKt {
+ 	public static final fun getUndeleteRedditPatch ()Lapp/morphe/patcher/patch/BytecodePatch;
+ }
+diff --git a/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/pool/ReuseHttpConnectionsPatch.kt b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/pool/ReuseHttpConnectionsPatch.kt
+new file mode 100644
+index 0000000..086dab7
+--- /dev/null
++++ b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/pool/ReuseHttpConnectionsPatch.kt
+@@ -0,0 +1,26 @@
++package app.morphe.patches.reddit.customclients.boostforreddit.http.pool
++
++import app.morphe.patcher.Fingerprint
++import app.morphe.patcher.patch.bytecodePatch
++import app.morphe.patches.reddit.customclients.boostforreddit.BoostCompatible
++import app.morphe.patches.reddit.customclients.boostforreddit.http.interceptHttpRequests
++import app.morphe.patches.reddit.customclients.boostforreddit.misc.extension.sharedExtensionPatch
++import app.morphe.util.returnEarly
++
++@Suppress("unused")
++val reuseHttpConnections = bytecodePatch(
++    name = "Reuse HTTP connections",
++    description = "Restores HTTP connection reuse on the app's network client. " +
++        "Boost disables idle connections, so every request pays a fresh TCP and TLS handshake. " +
++        "Experimental: turn off if downloads fail after switching networks.",
++) {
++    dependsOn(interceptHttpRequests, sharedExtensionPatch)
++    compatibleWith(*BoostCompatible)
++
++    execute {
++        Fingerprint(
++            definingClass = "Lapp/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch;",
++            name = "isPatchIncluded",
++        ).method.returnEarly(true)
++    }
++}
