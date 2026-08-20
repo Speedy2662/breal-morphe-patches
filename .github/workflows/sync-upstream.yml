@@ -1,0 +1,128 @@
+name: Sync upstream and build
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if this fork already has a release for the latest upstream tag'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '23 5 * * *'
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: brealorg/breal-morphe-patches
+  PATCH_FILE: fork-patches/media-loading-fix.patch
+
+jobs:
+  sync:
+    name: Build upstream release with local patch
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Determine upstream release
+        id: upstream
+        run: |
+          set -euo pipefail
+          TAG="$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)"
+          echo "Upstream latest release: $TAG"
+          HAVE="$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || echo none)"
+          echo "Fork latest release: $HAVE"
+          if [ "$TAG" = "$HAVE" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Fork is already up to date."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Get upstream source at release tag
+        if: steps.upstream.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.upstream.outputs.tag }}" \
+            "https://github.com/$UPSTREAM.git" upstream-src
+
+      - name: Apply local patch
+        if: steps.upstream.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          git -C upstream-src apply --stat "$GITHUB_WORKSPACE/$PATCH_FILE"
+          git -C upstream-src apply "$GITHUB_WORKSPACE/$PATCH_FILE"
+
+      - name: Setup Java
+        if: steps.upstream.outputs.skip == 'false'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Cache Gradle
+        if: steps.upstream.outputs.skip == 'false'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd upstream-src
+          ./gradlew :patches:buildAndroid --no-daemon
+
+      - name: Verify artifact
+        if: steps.upstream.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          MPP="$(ls upstream-src/patches/build/libs/patches-*.mpp)"
+          unzip -l "$MPP" | grep -Ei 'classes.*\.dex'
+          unzip -l "$MPP" | grep -F 'extensions/boostforreddit.mpe'
+          VERSION="$(basename "$MPP" .mpp)"
+          VERSION="${VERSION#patches-}"
+          echo "MPP=$MPP" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Publish release
+        if: steps.upstream.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.upstream.outputs.tag }}"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            gh release delete "$TAG" --repo "${{ github.repository }}" --yes || true
+            git push origin ":refs/tags/$TAG" || true
+          fi
+          gh release create "$TAG" "$MPP" \
+            --repo "${{ github.repository }}" \
+            --title "patches-$VERSION" \
+            --notes "Upstream $TAG with local fixes applied. See fork-patches/."
+
+      - name: Update patch source feed
+        if: steps.upstream.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%S)"
+          jq -n \
+            --arg created_at "$CREATED_AT" \
+            --arg description "Breal Morphe Patches $VERSION with local media loading fixes for Boost for Reddit." \
+            --arg download_url "https://github.com/${{ github.repository }}/releases/download/${{ steps.upstream.outputs.tag }}/patches-$VERSION.mpp" \
+            --arg version "$VERSION" \
+            '{created_at: $created_at, description: $description, download_url: $download_url, version: $version}' \
+            > patches-bundle.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add patches-bundle.json
+          git commit -m "Update patch source feed for $VERSION"
+          git push

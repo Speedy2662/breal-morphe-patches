@@ -1,0 +1,296 @@
+diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/FixRedgifsApiPatch.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/FixRedgifsApiPatch.java
+index dab8d39..b62da79 100644
+--- a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/FixRedgifsApiPatch.java
++++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/FixRedgifsApiPatch.java
+@@ -7,6 +7,8 @@
+ 
+ package app.morphe.extension.boostforreddit;
+ 
++import java.util.concurrent.TimeUnit;
++
+ import app.morphe.extension.shared.fixes.redgifs.BaseFixRedgifsApiPatch;
+ import okhttp3.OkHttpClient;
+ 
+@@ -18,12 +20,44 @@ public class FixRedgifsApiPatch extends BaseFixRedgifsApiPatch {
+         INSTANCE = new FixRedgifsApiPatch();
+     }
+ 
++    /**
++     * Shared client. The patch replaces {@code OkHttpClient.Builder.build()} inside
++     * {@code RedGifsAPIv2}, so {@link #createClient()} runs every time Boost constructs its
++     * Redgifs API object rather than once at startup.
++     *
++     * <p>Returning a new client per call gave each of those its own connection pool and
++     * dispatcher, so no TCP connection or TLS session was ever reused: every media open paid a
++     * fresh handshake to api.redgifs.com before a byte of video moved, and nothing could be
++     * multiplexed over HTTP/2. A single shared client is the usage OkHttp is designed for, and
++     * is what the BaconReader and Sync variants get for free by extending the app's own builder
++     * instead of replacing it.
++     */
++    private static volatile OkHttpClient client;
++
+     public String getDefaultUserAgent() {
+         // Boost uses a static user agent for Redgifs API calls
+         return "Boost";
+     }
+ 
+     public static OkHttpClient createClient() {
+-        return new OkHttpClient.Builder().addInterceptor(INSTANCE).build();
++        OkHttpClient instance = client;
++        if (instance != null) {
++            return instance;
++        }
++
++        synchronized (FixRedgifsApiPatch.class) {
++            if (client == null) {
++                // The original builder is discarded by the patch, so whatever timeouts Boost
++                // configured on it are gone and have to be re-established here.
++                client = new OkHttpClient.Builder()
++                        .addInterceptor(INSTANCE)
++                        .connectTimeout(10, TimeUnit.SECONDS)
++                        .readTimeout(20, TimeUnit.SECONDS)
++                        .writeTimeout(10, TimeUnit.SECONDS)
++                        .retryOnConnectionFailure(true)
++                        .build();
++            }
++            return client;
++        }
+     }
+ }
+diff --git a/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/BaseFixRedgifsApiPatch.java b/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/BaseFixRedgifsApiPatch.java
+index cd31d98..637e136 100644
+--- a/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/BaseFixRedgifsApiPatch.java
++++ b/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/BaseFixRedgifsApiPatch.java
+@@ -41,10 +41,30 @@ public abstract class BaseFixRedgifsApiPatch extends PatchedditInterceptor {
+             if (response.isSuccessful()) {
+                 return response;
+             }
++
++            int responseCode = response.code();
+             // It's possible that the user agent is being overwritten later down in the interceptor
+             // chain, so make sure we grab the new user agent from the request headers.
+-            userAgent = response.request().header("User-Agent");
++            String downstreamUserAgent = response.request().header("User-Agent");
+             response.close();
++
++            if (downstreamUserAgent != null && !downstreamUserAgent.isEmpty()) {
++                userAgent = downstreamUserAgent;
++            }
++
++            // The cached token has a locally guessed 23 hour expiry, but Redgifs decides the real
++            // one. When the server rejects a token before that guess runs out, the cache still
++            // considers it valid and hands the same dead token back on every retry, so playback
++            // stays broken until the process restarts. Drop it here so the refresh below fetches
++            // a live one.
++            //
++            // Only auth rejections invalidate. A 5xx or a rate limit says nothing about the
++            // token's validity, and discarding it there would trigger a re-auth storm against a
++            // service that is already failing.
++            if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED
++                    || responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
++                RedgifsTokenManager.invalidateToken(userAgent);
++            }
+         }
+ 
+         try {
+diff --git a/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/RedgifsTokenManager.java b/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/RedgifsTokenManager.java
+index af211dd..d6930bb 100644
+--- a/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/RedgifsTokenManager.java
++++ b/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/RedgifsTokenManager.java
+@@ -2,7 +2,11 @@ package app.morphe.extension.shared.fixes.redgifs;
+ 
+ import static app.morphe.extension.shared.requests.Route.Method.GET;
+ 
++import android.os.SystemClock;
++
+ import androidx.annotation.GuardedBy;
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
+ 
+ import org.json.JSONException;
+ import org.json.JSONObject;
+@@ -10,14 +14,20 @@ import org.json.JSONObject;
+ import java.io.IOException;
+ import java.net.HttpURLConnection;
+ import java.net.URL;
+-import java.util.HashMap;
+ import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
+ 
++import app.morphe.extension.shared.Logger;
+ import app.morphe.extension.shared.requests.Requester;
+ 
+ 
+ /**
+  * Manages Redgifs token lifecycle.
++ *
++ * <p>Threading contract: the token fetch is single-flight <i>per user agent</i>. Concurrent
++ * callers sharing a user agent wait for one in-flight fetch rather than issuing N of them,
++ * but callers using different user agents never block each other. No network call is ever
++ * made while holding the lock that guards the slot map.
+  */
+ public class RedgifsTokenManager {
+     public static class RedgifsToken {
+@@ -45,10 +55,49 @@ public class RedgifsTokenManager {
+             return getExpiryTimeInSeconds() >= System.currentTimeMillis() / 1000;
+         }
+     }
++
++    /**
++     * Per user agent state. Its monitor is the single-flight lock for that user agent;
++     * it is deliberately <b>not</b> the monitor of the slot map, so a slow token fetch
++     * for one user agent cannot stall lookups for another.
++     */
++    private static final class TokenSlot {
++        @GuardedBy("this")
++        @Nullable
++        RedgifsToken token;
++
++        /** Uptime millis of the last failed fetch, or 0 if the last fetch succeeded. */
++        @GuardedBy("this")
++        long lastFailureUptimeMillis;
++
++        @GuardedBy("this")
++        int consecutiveFailures;
++    }
++
+     public static final String REDGIFS_API_HOST = "https://api.redgifs.com";
+     private static final String GET_TEMPORARY_TOKEN = REDGIFS_API_HOST + "/v2/auth/temporary";
+-    @GuardedBy("itself")
+-    private static final Map<String, RedgifsToken> tokenMap = new HashMap<>();
++
++    /**
++     * Bound how long a media open can stall on the token endpoint.
++     *
++     * <p>Without these, {@link HttpURLConnection} inherits the platform default, which on
++     * Android is an unbounded read. A single hung token fetch then blocks every subsequent
++     * Redgifs request for as long as the socket stays open, which presents as media that
++     * spins forever instead of failing. The sibling SLinks fix sets 2000ms; these are more
++     * generous because the token endpoint is only reached once per token lifetime and a
++     * spurious timeout costs a full re-auth.
++     */
++    private static final int CONNECT_TIMEOUT_MILLIS = 3000;
++    private static final int READ_TIMEOUT_MILLIS = 5000;
++
++    /**
++     * After a failed fetch, fail fast instead of making every queued media request pay the
++     * full timeout again. Backoff doubles from 1s and is capped, so recovery stays quick.
++     */
++    private static final long BACKOFF_BASE_MILLIS = 1000;
++    private static final long BACKOFF_MAX_MILLIS = 10_000;
++
++    private static final Map<String, TokenSlot> tokenSlots = new ConcurrentHashMap<>();
+ 
+     private static String getToken(String userAgent) throws IOException, JSONException {
+         HttpURLConnection connection = (HttpURLConnection) new URL(GET_TEMPORARY_TOKEN).openConnection();
+@@ -58,26 +107,101 @@ public class RedgifsTokenManager {
+         connection.setRequestProperty("Content-Type", "application/json");
+         connection.setRequestProperty("Accept", "application/json");
+         connection.setUseCaches(false);
++        connection.setConnectTimeout(CONNECT_TIMEOUT_MILLIS);
++        connection.setReadTimeout(READ_TIMEOUT_MILLIS);
+ 
++        // Not disconnected: further requests to api.redgifs.com are expected shortly, and
++        // disconnecting would discard the pooled connection they would otherwise reuse.
+         JSONObject responseObject = Requester.parseJSONObject(connection);
+         return responseObject.getString("token");
+     }
+ 
++    @NonNull
++    private static TokenSlot slotFor(@NonNull String userAgent) {
++        TokenSlot slot = tokenSlots.get(userAgent);
++        if (slot != null) {
++            return slot;
++        }
++        TokenSlot created = new TokenSlot();
++        TokenSlot raced = tokenSlots.putIfAbsent(userAgent, created);
++        return raced != null ? raced : created;
++    }
++
++    @GuardedBy("slot")
++    private static long remainingBackoffMillis(TokenSlot slot) {
++        if (slot.consecutiveFailures == 0) {
++            return 0;
++        }
++        long window = Math.min(
++                BACKOFF_MAX_MILLIS,
++                BACKOFF_BASE_MILLIS << Math.min(slot.consecutiveFailures - 1, 20));
++        long elapsed = SystemClock.elapsedRealtime() - slot.lastFailureUptimeMillis;
++        return Math.max(0, window - elapsed);
++    }
++
+     public static RedgifsToken refreshToken(String userAgent) throws IOException, JSONException {
+-        synchronized(tokenMap) {
++        if (userAgent == null || userAgent.isEmpty()) {
++            // Sending a null User-Agent throws inside HttpURLConnection, and Redgifs binds the
++            // token to the user agent that requested it, so an empty one yields a token that
++            // fails verification on every subsequent request.
++            throw new IOException("No user agent available for Redgifs token request");
++        }
++
++        // The slot map is never held across the network call below.
++        TokenSlot slot = slotFor(userAgent);
++
++        synchronized (slot) {
+             // Reference: https://github.com/JeffreyCA/Apollo-ImprovedCustomApi/pull/67
+-            RedgifsToken token = tokenMap.get(userAgent);
++            RedgifsToken token = slot.token;
+             if (token != null && token.isValid()) {
+                 return token;
+             }
+ 
+-            // Copy user agent from original request if present because Redgifs verifies
+-            // that the user agent in subsequent requests matches the one in the OAuth token.
+-            String accessToken = getToken(userAgent);
+-            long refreshTime = System.currentTimeMillis() / 1000;
+-            token = new RedgifsToken(accessToken, refreshTime);
+-            tokenMap.put(userAgent, token);
+-            return token;
++            long backoff = remainingBackoffMillis(slot);
++            if (backoff > 0) {
++                throw new IOException("Redgifs token endpoint recently failed, retrying in "
++                        + backoff + "ms");
++            }
++
++            try {
++                // Copy user agent from original request if present because Redgifs verifies
++                // that the user agent in subsequent requests matches the one in the OAuth token.
++                String accessToken = getToken(userAgent);
++                long refreshTime = System.currentTimeMillis() / 1000;
++                token = new RedgifsToken(accessToken, refreshTime);
++                slot.token = token;
++                slot.consecutiveFailures = 0;
++                slot.lastFailureUptimeMillis = 0;
++                return token;
++            } catch (IOException | JSONException ex) {
++                slot.consecutiveFailures++;
++                slot.lastFailureUptimeMillis = SystemClock.elapsedRealtime();
++                throw ex;
++            }
++        }
++    }
++
++    /**
++     * Drops the cached token for a user agent so the next call fetches a fresh one.
++     *
++     * <p>Required because the local 23 hour expiry is only a guess at the server's. When
++     * Redgifs rejects a token earlier than that, {@link #refreshToken} would otherwise keep
++     * returning the same rejected token until the process restarts, so playback stays broken
++     * for the rest of the session.
++     */
++    public static void invalidateToken(@Nullable String userAgent) {
++        if (userAgent == null) {
++            return;
++        }
++        TokenSlot slot = tokenSlots.get(userAgent);
++        if (slot == null) {
++            return;
++        }
++        synchronized (slot) {
++            if (slot.token != null) {
++                Logger.printDebug(() -> "Invalidating rejected Redgifs token");
++                slot.token = null;
++            }
+         }
+     }
+ 
