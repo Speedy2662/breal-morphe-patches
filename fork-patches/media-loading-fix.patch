@@ -219,30 +219,41 @@ index 0000000..725a117
 +}
 diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java
 new file mode 100644
-index 0000000..7964c8f
+index 0000000..9d692cd
 --- /dev/null
 +++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,82 @@
 +package app.morphe.extension.boostforreddit.video;
 +
 +import app.morphe.extension.shared.Logger;
 +
 +/**
 + * Shared position store that lets the full-screen video viewer resume from where the
-+ * inline feed player left off (and, in a later pass, vice versa). Matching is keyed on the
-+ * Reddit submission id so a position can never be applied to the wrong video.
++ * inline feed player left off. Matching is keyed on the Reddit submission id so a position
++ * can never be applied to the wrong video.
 + *
 + * <p>All entry points are no-ops unless the "Resume video position" patch is selected
 + * ({@link #isPatchIncluded()} is rewritten to return true by the patch). Player objects are
-+ * never touched here; the patch reads {@code getCurrentPosition()} and calls {@code seekTo}
-+ * in bytecode and only hands this class primitives, so the extension needs no ExoPlayer types.
++ * never touched here; the patch reads {@code getCurrentPosition()} in bytecode and only hands
++ * this class primitives, so the extension needs no ExoPlayer types.
++ *
++ * <p>Flow: {@link #onFeedPlay} tracks which submission the inline player is on;
++ * {@link #saveFeedPosition} fires whenever that player pauses or is released (which includes
++ * the moment a post is tapped open) and arms a one-shot "pending resume" for that submission;
++ * {@link #feedToViewer} consumes it exactly once. Consuming clears only the pending resume, not
++ * the tracked submission, so the next tap arms a fresh one. Within a viewer session the pending
++ * resume is already spent, so the user's own seeks are left alone.
 + */
 +public final class VideoResumePatch {
 +    /** Ignore trivially small positions; resuming a video that barely started is pointless. */
 +    private static final long MIN_RESUME_MS = 3000;
 +
++    /** The submission the inline feed player is currently on. */
 +    private static volatile String feedId;
-+    private static volatile long feedPositionMs = -1;
++
++    /** One-shot resume target, armed each time the feed player pauses/releases. */
++    private static volatile String pendingId;
++    private static volatile long pendingPositionMs = -1;
 +
 +    public static boolean isPatchIncluded() {
 +        // Overridden by patch.
@@ -254,36 +265,38 @@ index 0000000..7964c8f
 +        if (!isPatchIncluded()) {
 +            return;
 +        }
-+        if (submissionId == null || !submissionId.equals(feedId)) {
-+            feedPositionMs = -1;
-+        }
 +        feedId = submissionId;
 +        Logger.printDebug(() -> "onFeedPlay id=" + submissionId);
 +    }
 +
-+    /** Snapshot of the inline feed player's position, taken as it pauses/leaves. */
++    /**
++     * The inline feed player paused or was released; arm a one-shot resume for whatever it was
++     * playing. Fires on every pause, so each tap that opens the viewer refreshes the target.
++     */
 +    public static void saveFeedPosition(long positionMs) {
 +        if (!isPatchIncluded()) {
 +            return;
 +        }
-+        feedPositionMs = positionMs;
-+        Logger.printDebug(() -> "saveFeedPosition id=" + feedId + " pos=" + positionMs);
++        if (positionMs >= MIN_RESUME_MS) {
++            pendingId = feedId;
++            pendingPositionMs = positionMs;
++            Logger.printDebug(() -> "saveFeedPosition id=" + feedId + " pos=" + positionMs);
++        }
 +    }
 +
 +    /**
-+     * The full-screen viewer is about to seek to {@code currentMs}. If the feed was last
-+     * playing this same submission past the threshold, resume from there instead.
++     * The full-screen viewer is about to seek to {@code currentMs}. If a resume is armed for
++     * this submission, consume it once and resume from there; otherwise leave the viewer's own
++     * position untouched.
 +     */
 +    public static long feedToViewer(String submissionId, long currentMs) {
 +        if (!isPatchIncluded()) {
 +            return currentMs;
 +        }
-+        if (submissionId != null && submissionId.equals(feedId) && feedPositionMs >= MIN_RESUME_MS) {
-+            long resume = feedPositionMs;
-+            // One-shot: clear so later re-entries into the viewer (e.g. pause/resume there) keep
-+            // the viewer's own position instead of snapping back to this stale feed position.
-+            feedId = null;
-+            feedPositionMs = -1;
++        if (submissionId != null && submissionId.equals(pendingId) && pendingPositionMs >= MIN_RESUME_MS) {
++            long resume = pendingPositionMs;
++            pendingId = null;
++            pendingPositionMs = -1;
 +            Logger.printDebug(() -> "feedToViewer resume id=" + submissionId + " pos=" + resume);
 +            return resume;
 +        }
