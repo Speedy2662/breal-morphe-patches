@@ -92,7 +92,7 @@ index b18a63d..278967d 100644
                  new RedditSubredditUndeleteInterceptor(),
 diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch.java
 new file mode 100644
-index 0000000..823a2f5
+index 0000000..4f81d10
 --- /dev/null
 +++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch.java
 @@ -0,0 +1,40 @@
@@ -113,7 +113,7 @@ index 0000000..823a2f5
 + * pool lets OkHttp reuse connections; stale ones are retried automatically
 + * ({@code retryOnConnectionFailure} is on by default).
 + *
-+ * <p>Only active when the "Reuse HTTP connections" patch is selected —
++ * <p>Only active when the "Reuse HTTP connections" patch is selected;
 + * {@link #isPatchIncluded()} is rewritten to return true by the patch.
 + */
 +public class ReuseHttpConnectionsPatch {
@@ -216,6 +216,81 @@ index 0000000..725a117
 +
 +        return changed ? builder.build() : null;
 +    }
++}
+diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java
+new file mode 100644
+index 0000000..7964c8f
+--- /dev/null
++++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java
+@@ -0,0 +1,69 @@
++package app.morphe.extension.boostforreddit.video;
++
++import app.morphe.extension.shared.Logger;
++
++/**
++ * Shared position store that lets the full-screen video viewer resume from where the
++ * inline feed player left off (and, in a later pass, vice versa). Matching is keyed on the
++ * Reddit submission id so a position can never be applied to the wrong video.
++ *
++ * <p>All entry points are no-ops unless the "Resume video position" patch is selected
++ * ({@link #isPatchIncluded()} is rewritten to return true by the patch). Player objects are
++ * never touched here; the patch reads {@code getCurrentPosition()} and calls {@code seekTo}
++ * in bytecode and only hands this class primitives, so the extension needs no ExoPlayer types.
++ */
++public final class VideoResumePatch {
++    /** Ignore trivially small positions; resuming a video that barely started is pointless. */
++    private static final long MIN_RESUME_MS = 3000;
++
++    private static volatile String feedId;
++    private static volatile long feedPositionMs = -1;
++
++    public static boolean isPatchIncluded() {
++        // Overridden by patch.
++        return false;
++    }
++
++    /** The inline feed player started playing the given submission. */
++    public static void onFeedPlay(String submissionId) {
++        if (!isPatchIncluded()) {
++            return;
++        }
++        if (submissionId == null || !submissionId.equals(feedId)) {
++            feedPositionMs = -1;
++        }
++        feedId = submissionId;
++        Logger.printDebug(() -> "onFeedPlay id=" + submissionId);
++    }
++
++    /** Snapshot of the inline feed player's position, taken as it pauses/leaves. */
++    public static void saveFeedPosition(long positionMs) {
++        if (!isPatchIncluded()) {
++            return;
++        }
++        feedPositionMs = positionMs;
++        Logger.printDebug(() -> "saveFeedPosition id=" + feedId + " pos=" + positionMs);
++    }
++
++    /**
++     * The full-screen viewer is about to seek to {@code currentMs}. If the feed was last
++     * playing this same submission past the threshold, resume from there instead.
++     */
++    public static long feedToViewer(String submissionId, long currentMs) {
++        if (!isPatchIncluded()) {
++            return currentMs;
++        }
++        if (submissionId != null && submissionId.equals(feedId) && feedPositionMs >= MIN_RESUME_MS) {
++            long resume = feedPositionMs;
++            // One-shot: clear so later re-entries into the viewer (e.g. pause/resume there) keep
++            // the viewer's own position instead of snapping back to this stale feed position.
++            feedId = null;
++            feedPositionMs = -1;
++            Logger.printDebug(() -> "feedToViewer resume id=" + submissionId + " pos=" + resume);
++            return resume;
++        }
++        return currentMs;
++    }
++
++    private VideoResumePatch() {}
 +}
 diff --git a/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/BaseFixRedgifsApiPatch.java b/extensions/shared/library/src/main/java/app/morphe/extension/shared/fixes/redgifs/BaseFixRedgifsApiPatch.java
 index cd31d98..637e136 100644
@@ -476,7 +551,7 @@ index 7b8b2ec..fbdfcd1 100644
              builder.addInterceptor(interceptor);
          }
 diff --git a/patches/api/patches.api b/patches/api/patches.api
-index a4fb681..870c709 100644
+index a4fb681..a592438 100644
 --- a/patches/api/patches.api
 +++ b/patches/api/patches.api
 @@ -106,6 +106,10 @@ public final class app/morphe/patches/reddit/customclients/boostforreddit/http/i
@@ -489,6 +564,17 @@ index a4fb681..870c709 100644
 +
  public final class app/morphe/patches/reddit/customclients/boostforreddit/http/reddit/UndeleteRedditPatchKt {
  	public static final fun getUndeleteRedditPatch ()Lapp/morphe/patcher/patch/BytecodePatch;
+ }
+@@ -114,6 +118,10 @@ public final class app/morphe/patches/reddit/customclients/boostforreddit/misc/e
+ 	public static final fun getSharedExtensionPatch ()Lapp/morphe/patcher/patch/BytecodePatch;
+ }
+ 
++public final class app/morphe/patches/reddit/customclients/boostforreddit/video/ResumeVideoPositionPatchKt {
++	public static final fun getResumeVideoPosition ()Lapp/morphe/patcher/patch/BytecodePatch;
++}
++
+ public final class app/morphe/patches/reddit/customclients/continuum/api/SpoofClientPatchKt {
+ 	public static final fun getSpoofClientPatch ()Lapp/morphe/patcher/patch/BytecodePatch;
  }
 diff --git a/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/pool/ReuseHttpConnectionsPatch.kt b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/pool/ReuseHttpConnectionsPatch.kt
 new file mode 100644
@@ -520,5 +606,193 @@ index 0000000..086dab7
 +            definingClass = "Lapp/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch;",
 +            name = "isPatchIncluded",
 +        ).method.returnEarly(true)
++    }
++}
+diff --git a/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/Fingerprints.kt b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/Fingerprints.kt
+new file mode 100644
+index 0000000..e1eb9f7
+--- /dev/null
++++ b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/Fingerprints.kt
+@@ -0,0 +1,35 @@
++package app.morphe.patches.reddit.customclients.boostforreddit.video
++
++import app.morphe.patcher.Fingerprint
++
++// Boost's inline feed player is class `Lcom/rubenmayayo/reddit/ui/fragments/a;` (source
++// BoostPlayer.java). A second copy exists for profile video lists; the resume feature targets
++// the main feed only, so the fingerprints pin the exact feed class type.
++private const val BOOST_PLAYER = "Lcom/rubenmayayo/reddit/ui/fragments/a;"
++private const val MEDIA_VIDEO_ACTIVITY = "Lcom/rubenmayayo/reddit/ui/activities/MediaVideoActivity;"
++
++// BoostPlayer.E(holder): starts playing a submission; "Get %s %s" logs submission.getId().
++internal val boostPlayerPlayFingerprint = Fingerprint(
++    strings = listOf("Get %s %s"),
++    custom = { _, classDef -> classDef.type == BOOST_PLAYER },
++)
++
++// BoostPlayer.A(): inline player pauses (viewer opening as an opaque activity).
++internal val boostPlayerPauseFingerprint = Fingerprint(
++    strings = listOf("Pause player"),
++    custom = { _, classDef -> classDef.type == BOOST_PLAYER },
++)
++
++// BoostPlayer.G(): inline player released; snapshot position before release.
++internal val boostPlayerReleaseFingerprint = Fingerprint(
++    strings = listOf("Release player"),
++    custom = { _, classDef -> classDef.type == BOOST_PLAYER },
++)
++
++// Anchors the MediaVideoActivity class (its player-init method logs "initializePlayer").
++// Used only to reach the class; the patch iterates its methods to find every seek-to-q site
++// (there are two: the media-build path and the resume path).
++internal val mediaVideoActivityFingerprint = Fingerprint(
++    strings = listOf("initializePlayer"),
++    custom = { _, classDef -> classDef.type == MEDIA_VIDEO_ACTIVITY },
++)
+diff --git a/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/ResumeVideoPositionPatch.kt b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/ResumeVideoPositionPatch.kt
+new file mode 100644
+index 0000000..f06ddf6
+--- /dev/null
++++ b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/ResumeVideoPositionPatch.kt
+@@ -0,0 +1,141 @@
++package app.morphe.patches.reddit.customclients.boostforreddit.video
++
++import app.morphe.patcher.Fingerprint
++import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
++import app.morphe.patcher.extensions.InstructionExtensions.addInstructionsWithLabels
++import app.morphe.patcher.extensions.InstructionExtensions.getInstruction
++import app.morphe.patcher.patch.bytecodePatch
++import app.morphe.patcher.util.proxy.mutableTypes.MutableMethod.Companion.toMutable
++import app.morphe.patches.reddit.customclients.boostforreddit.BoostCompatible
++import app.morphe.patches.reddit.customclients.boostforreddit.http.interceptHttpRequests
++import app.morphe.patches.reddit.customclients.boostforreddit.misc.extension.sharedExtensionPatch
++import app.morphe.util.getReference
++import app.morphe.util.indexOfFirstInstructionOrThrow
++import app.morphe.util.returnEarly
++import com.android.tools.smali.dexlib2.AccessFlags
++import com.android.tools.smali.dexlib2.Opcode
++import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
++import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
++import com.android.tools.smali.dexlib2.iface.reference.MethodReference
++import com.android.tools.smali.dexlib2.immutable.ImmutableMethod
++
++private const val EXTENSION = "Lapp/morphe/extension/boostforreddit/video/VideoResumePatch;"
++private const val BOOST_PLAYER = "Lcom/rubenmayayo/reddit/ui/fragments/a;"
++private const val MEDIA_VIDEO_ACTIVITY = "Lcom/rubenmayayo/reddit/ui/activities/MediaVideoActivity;"
++private const val PLAYER_FIELD = "$BOOST_PLAYER->a:Lcom/google/android/exoplayer2/k;"
++private const val GET_POSITION = "Lcom/google/android/exoplayer2/w1;->getCurrentPosition()J"
++private const val SUBMISSION_FIELD =
++    "Lcom/rubenmayayo/reddit/ui/activities/MediaActivity;->g:Lcom/rubenmayayo/reddit/models/reddit/SubmissionModel;"
++private const val GET_ID = "Lcom/rubenmayayo/reddit/models/reddit/ThingModel;->getId()Ljava/lang/String;"
++private const val POSITION_FIELD = "$MEDIA_VIDEO_ACTIVITY->q:J"
++
++private const val SAVE_HELPER = "morpheSaveFeedPosition"
++private const val RESUME_HELPER = "morpheApplyResume"
++
++@Suppress("unused")
++val resumeVideoPosition = bytecodePatch(
++    name = "Resume video position",
++    description = "When you open a feed video full-screen, resume playback from where the inline " +
++        "preview was instead of restarting at the beginning. Experimental.",
++    default = false,
++) {
++    dependsOn(interceptHttpRequests, sharedExtensionPatch)
++    compatibleWith(*BoostCompatible)
++
++    execute {
++        // Enable the extension entry points only when this patch is selected.
++        Fingerprint(definingClass = EXTENSION, name = "isPatchIncluded").method.returnEarly(true)
++
++        // region Feed side: record the playing submission id, snapshot position on pause/release.
++
++        // Add a self-guarded helper that reads the inline player's position and stores it.
++        boostPlayerPauseFingerprint.classDef.methods.add(
++            ImmutableMethod(
++                BOOST_PLAYER, SAVE_HELPER, emptyList(), "V",
++                AccessFlags.PUBLIC.value, null, null, MutableMethodImplementation(3),
++            ).toMutable().apply {
++                addInstructionsWithLabels(
++                    0,
++                    """
++                    iget-object v0, p0, $PLAYER_FIELD
++                    if-eqz v0, :done
++                    invoke-interface { v0 }, $GET_POSITION
++                    move-result-wide v0
++                    invoke-static { v0, v1 }, $EXTENSION->saveFeedPosition(J)V
++                    :done
++                    return-void
++                    """,
++                )
++            },
++        )
++
++        // Record the currently-playing submission id where E() logs "Get %s %s".
++        boostPlayerPlayFingerprint.method.apply {
++            val getIdIndex = indexOfFirstInstructionOrThrow {
++                opcode == Opcode.INVOKE_VIRTUAL && getReference<MethodReference>()?.name == "getId"
++            }
++            val idRegister = getInstruction<OneRegisterInstruction>(getIdIndex + 1).registerA
++            addInstructions(
++                getIdIndex + 2,
++                "invoke-static { v$idRegister }, $EXTENSION->onFeedPlay(Ljava/lang/String;)V",
++            )
++        }
++
++        // Snapshot position when the inline player pauses or is released.
++        boostPlayerPauseFingerprint.method.addInstructions(
++            0, "invoke-virtual { p0 }, $BOOST_PLAYER->$SAVE_HELPER()V",
++        )
++        boostPlayerReleaseFingerprint.method.addInstructions(
++            0, "invoke-virtual { p0 }, $BOOST_PLAYER->$SAVE_HELPER()V",
++        )
++
++        // endregion
++
++        // region Viewer side: before it seeks, ask the extension to resume from the feed position.
++
++        val viewerClass = mediaVideoActivityFingerprint.classDef
++        viewerClass.methods.add(
++            ImmutableMethod(
++                MEDIA_VIDEO_ACTIVITY, RESUME_HELPER, emptyList(), "V",
++                AccessFlags.PUBLIC.value, null, null, MutableMethodImplementation(4),
++            ).toMutable().apply {
++                addInstructionsWithLabels(
++                    0,
++                    """
++                    iget-object v0, p0, $SUBMISSION_FIELD
++                    if-eqz v0, :done
++                    invoke-virtual { v0 }, $GET_ID
++                    move-result-object v0
++                    iget-wide v1, p0, $POSITION_FIELD
++                    invoke-static { v0, v1, v2 }, $EXTENSION->feedToViewer(Ljava/lang/String;J)J
++                    move-result-wide v1
++                    iput-wide v1, p0, $POSITION_FIELD
++                    :done
++                    return-void
++                    """,
++                )
++            },
++        )
++
++        // Inject the resume call into every method that seeks the viewer player to q:J
++        // (the media-build path and the resume path). feedToViewer is one-shot, so whichever
++        // runs first resumes and the other is a no-op.
++        viewerClass.methods.filter { method ->
++            method.name != RESUME_HELPER &&
++                method.implementation?.instructions?.any {
++                    (it as? com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction)
++                        ?.reference?.toString() == "Lcom/google/android/exoplayer2/w1;->K(J)V"
++                } == true &&
++                method.implementation?.instructions?.any {
++                    (it as? com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction)
++                        ?.reference?.toString()?.endsWith("MediaVideoActivity;->q:J") == true
++                } == true
++        }.forEach { method ->
++            method.addInstructions(
++                0, "invoke-virtual { p0 }, $MEDIA_VIDEO_ACTIVITY->$RESUME_HELPER()V",
++            )
++        }
++
++        // endregion
 +    }
 +}
