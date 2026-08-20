@@ -219,10 +219,10 @@ index 0000000..725a117
 +}
 diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java
 new file mode 100644
-index 0000000..9d692cd
+index 0000000..38bcf4f
 --- /dev/null
 +++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,70 @@
 +package app.morphe.extension.boostforreddit.video;
 +
 +import app.morphe.extension.shared.Logger;
@@ -234,22 +234,19 @@ index 0000000..9d692cd
 + *
 + * <p>All entry points are no-ops unless the "Resume video position" patch is selected
 + * ({@link #isPatchIncluded()} is rewritten to return true by the patch). Player objects are
-+ * never touched here; the patch reads {@code getCurrentPosition()} in bytecode and only hands
-+ * this class primitives, so the extension needs no ExoPlayer types.
++ * never touched here; the patch reads the id and {@code getCurrentPosition()} in bytecode and
++ * only hands this class primitives, so the extension needs no app types.
 + *
-+ * <p>Flow: {@link #onFeedPlay} tracks which submission the inline player is on;
-+ * {@link #saveFeedPosition} fires whenever that player pauses or is released (which includes
-+ * the moment a post is tapped open) and arms a one-shot "pending resume" for that submission;
-+ * {@link #feedToViewer} consumes it exactly once. Consuming clears only the pending resume, not
-+ * the tracked submission, so the next tap arms a fresh one. Within a viewer session the pending
-+ * resume is already spent, so the user's own seeks are left alone.
++ * <p>Flow: {@link #saveFeedPosition} fires whenever the inline feed player pauses or is
++ * released (which includes the moment a post is tapped open). The patch reads the id and the
++ * position together from the feed player's current holder, so the pending resume always matches
++ * the video that was actually playing, regardless of how the feed switched to it.
++ * {@link #feedToViewer} consumes the pending resume exactly once. Within a viewer session it is
++ * already spent, so the user's own seeks are left alone.
 + */
 +public final class VideoResumePatch {
 +    /** Ignore trivially small positions; resuming a video that barely started is pointless. */
 +    private static final long MIN_RESUME_MS = 3000;
-+
-+    /** The submission the inline feed player is currently on. */
-+    private static volatile String feedId;
 +
 +    /** One-shot resume target, armed each time the feed player pauses/releases. */
 +    private static volatile String pendingId;
@@ -260,27 +257,18 @@ index 0000000..9d692cd
 +        return false;
 +    }
 +
-+    /** The inline feed player started playing the given submission. */
-+    public static void onFeedPlay(String submissionId) {
-+        if (!isPatchIncluded()) {
-+            return;
-+        }
-+        feedId = submissionId;
-+        Logger.printDebug(() -> "onFeedPlay id=" + submissionId);
-+    }
-+
 +    /**
-+     * The inline feed player paused or was released; arm a one-shot resume for whatever it was
-+     * playing. Fires on every pause, so each tap that opens the viewer refreshes the target.
++     * The inline feed player paused or was released while playing {@code submissionId}; arm a
++     * one-shot resume. Fires on every pause, so each tap that opens the viewer refreshes it.
 +     */
-+    public static void saveFeedPosition(long positionMs) {
++    public static void saveFeedPosition(String submissionId, long positionMs) {
 +        if (!isPatchIncluded()) {
 +            return;
 +        }
-+        if (positionMs >= MIN_RESUME_MS) {
-+            pendingId = feedId;
++        if (submissionId != null && positionMs >= MIN_RESUME_MS) {
++            pendingId = submissionId;
 +            pendingPositionMs = positionMs;
-+            Logger.printDebug(() -> "saveFeedPosition id=" + feedId + " pos=" + positionMs);
++            Logger.printDebug(() -> "saveFeedPosition id=" + submissionId + " pos=" + positionMs);
 +        }
 +    }
 +
@@ -623,10 +611,10 @@ index 0000000..086dab7
 +}
 diff --git a/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/Fingerprints.kt b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/Fingerprints.kt
 new file mode 100644
-index 0000000..e1eb9f7
+index 0000000..35d65c2
 --- /dev/null
 +++ b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/Fingerprints.kt
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,29 @@
 +package app.morphe.patches.reddit.customclients.boostforreddit.video
 +
 +import app.morphe.patcher.Fingerprint
@@ -636,12 +624,6 @@ index 0000000..e1eb9f7
 +// the main feed only, so the fingerprints pin the exact feed class type.
 +private const val BOOST_PLAYER = "Lcom/rubenmayayo/reddit/ui/fragments/a;"
 +private const val MEDIA_VIDEO_ACTIVITY = "Lcom/rubenmayayo/reddit/ui/activities/MediaVideoActivity;"
-+
-+// BoostPlayer.E(holder): starts playing a submission; "Get %s %s" logs submission.getId().
-+internal val boostPlayerPlayFingerprint = Fingerprint(
-+    strings = listOf("Get %s %s"),
-+    custom = { _, classDef -> classDef.type == BOOST_PLAYER },
-+)
 +
 +// BoostPlayer.A(): inline player pauses (viewer opening as an opaque activity).
 +internal val boostPlayerPauseFingerprint = Fingerprint(
@@ -664,35 +646,33 @@ index 0000000..e1eb9f7
 +)
 diff --git a/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/ResumeVideoPositionPatch.kt b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/ResumeVideoPositionPatch.kt
 new file mode 100644
-index 0000000..f06ddf6
+index 0000000..01f7c08
 --- /dev/null
 +++ b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/video/ResumeVideoPositionPatch.kt
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,136 @@
 +package app.morphe.patches.reddit.customclients.boostforreddit.video
 +
 +import app.morphe.patcher.Fingerprint
 +import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
 +import app.morphe.patcher.extensions.InstructionExtensions.addInstructionsWithLabels
-+import app.morphe.patcher.extensions.InstructionExtensions.getInstruction
 +import app.morphe.patcher.patch.bytecodePatch
 +import app.morphe.patcher.util.proxy.mutableTypes.MutableMethod.Companion.toMutable
 +import app.morphe.patches.reddit.customclients.boostforreddit.BoostCompatible
 +import app.morphe.patches.reddit.customclients.boostforreddit.http.interceptHttpRequests
 +import app.morphe.patches.reddit.customclients.boostforreddit.misc.extension.sharedExtensionPatch
-+import app.morphe.util.getReference
-+import app.morphe.util.indexOfFirstInstructionOrThrow
 +import app.morphe.util.returnEarly
 +import com.android.tools.smali.dexlib2.AccessFlags
-+import com.android.tools.smali.dexlib2.Opcode
 +import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
-+import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
-+import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 +import com.android.tools.smali.dexlib2.immutable.ImmutableMethod
 +
 +private const val EXTENSION = "Lapp/morphe/extension/boostforreddit/video/VideoResumePatch;"
 +private const val BOOST_PLAYER = "Lcom/rubenmayayo/reddit/ui/fragments/a;"
 +private const val MEDIA_VIDEO_ACTIVITY = "Lcom/rubenmayayo/reddit/ui/activities/MediaVideoActivity;"
 +private const val PLAYER_FIELD = "$BOOST_PLAYER->a:Lcom/google/android/exoplayer2/k;"
++private const val HOLDER_FIELD =
++    "$BOOST_PLAYER->k:Lcom/rubenmayayo/reddit/ui/fragments/SubmissionRecyclerViewLinearCardsVideoFragment\$VideoAdapter\$VideoSubmissionViewHolder;"
++private const val HOLDER_GET_SUBMISSION =
++    "Lcom/rubenmayayo/reddit/ui/fragments/SubmissionRecyclerViewLinearCardsVideoFragment\$VideoAdapter\$VideoSubmissionViewHolder;->o1()Lcom/rubenmayayo/reddit/models/reddit/SubmissionModel;"
 +private const val GET_POSITION = "Lcom/google/android/exoplayer2/w1;->getCurrentPosition()J"
 +private const val SUBMISSION_FIELD =
 +    "Lcom/rubenmayayo/reddit/ui/activities/MediaActivity;->g:Lcom/rubenmayayo/reddit/models/reddit/SubmissionModel;"
@@ -716,22 +696,31 @@ index 0000000..f06ddf6
 +        // Enable the extension entry points only when this patch is selected.
 +        Fingerprint(definingClass = EXTENSION, name = "isPatchIncluded").method.returnEarly(true)
 +
-+        // region Feed side: record the playing submission id, snapshot position on pause/release.
++        // region Feed side: snapshot the playing submission id + position on pause/release.
 +
-+        // Add a self-guarded helper that reads the inline player's position and stores it.
++        // Self-guarded helper: read the current holder's submission id and the player's position
++        // (atomically, from whatever is actually playing) and arm the resume.
 +        boostPlayerPauseFingerprint.classDef.methods.add(
 +            ImmutableMethod(
 +                BOOST_PLAYER, SAVE_HELPER, emptyList(), "V",
-+                AccessFlags.PUBLIC.value, null, null, MutableMethodImplementation(3),
++                AccessFlags.PUBLIC.value, null, null, MutableMethodImplementation(4),
 +            ).toMutable().apply {
 +                addInstructionsWithLabels(
 +                    0,
 +                    """
-+                    iget-object v0, p0, $PLAYER_FIELD
++                    iget-object v0, p0, $HOLDER_FIELD
 +                    if-eqz v0, :done
-+                    invoke-interface { v0 }, $GET_POSITION
-+                    move-result-wide v0
-+                    invoke-static { v0, v1 }, $EXTENSION->saveFeedPosition(J)V
++                    invoke-virtual { v0 }, $HOLDER_GET_SUBMISSION
++                    move-result-object v0
++                    if-eqz v0, :done
++                    invoke-virtual { v0 }, $GET_ID
++                    move-result-object v0
++                    if-eqz v0, :done
++                    iget-object v1, p0, $PLAYER_FIELD
++                    if-eqz v1, :done
++                    invoke-interface { v1 }, $GET_POSITION
++                    move-result-wide v1
++                    invoke-static { v0, v1, v2 }, $EXTENSION->saveFeedPosition(Ljava/lang/String;J)V
 +                    :done
 +                    return-void
 +                    """,
@@ -739,19 +728,7 @@ index 0000000..f06ddf6
 +            },
 +        )
 +
-+        // Record the currently-playing submission id where E() logs "Get %s %s".
-+        boostPlayerPlayFingerprint.method.apply {
-+            val getIdIndex = indexOfFirstInstructionOrThrow {
-+                opcode == Opcode.INVOKE_VIRTUAL && getReference<MethodReference>()?.name == "getId"
-+            }
-+            val idRegister = getInstruction<OneRegisterInstruction>(getIdIndex + 1).registerA
-+            addInstructions(
-+                getIdIndex + 2,
-+                "invoke-static { v$idRegister }, $EXTENSION->onFeedPlay(Ljava/lang/String;)V",
-+            )
-+        }
-+
-+        // Snapshot position when the inline player pauses or is released.
++        // Snapshot when the inline player pauses or is released.
 +        boostPlayerPauseFingerprint.method.addInstructions(
 +            0, "invoke-virtual { p0 }, $BOOST_PLAYER->$SAVE_HELPER()V",
 +        )
