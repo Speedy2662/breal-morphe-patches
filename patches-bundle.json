@@ -1,7 +1,6 @@
 {
-  "created_at": "2026-08-17T17:02:08",
-  "description": "Fix Boost Image Viewer safe-area layout so images stay clear of system bars and display cutouts.\n",
-  "download_url": "https://github.com/brealorg/breal-morphe-patches/releases/download/morphe-patches-110/patches-1.4.110.mpp",
-  "signature_download_url": "https://github.com/brealorg/breal-morphe-patches/releases/download/morphe-patches-110/patches-1.4.110.mpp.asc",
+  "created_at": "2026-08-20T01:07:56",
+  "description": "Breal Morphe Patches 1.4.110 with local media loading fixes for Boost for Reddit.",
+  "download_url": "https://github.com/Speedy2662/breal-morphe-patches/releases/download/morphe-patches-110/patches-1.4.110.mpp",
   "version": "1.4.110"
 }
