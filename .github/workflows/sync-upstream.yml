@@ -32,6 +32,8 @@ jobs:
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Determine upstream release
         id: upstream
@@ -39,15 +41,20 @@ jobs:
           set -euo pipefail
           TAG="$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)"
           echo "Upstream latest release: $TAG"
-          HAVE="$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || echo none)"
-          echo "Fork latest release: $HAVE"
-          if [ "$TAG" = "$HAVE" ] && [ "${{ inputs.force }}" != "true" ]; then
+          # Bumps whenever the local patch changes, so every fork build gets a higher version.
+          REV="$(git rev-list --count HEAD -- "$PATCH_FILE")"
+          FORK_TAG="$TAG-r$REV"
+          echo "Fork release: $FORK_TAG"
+          if gh release view "$FORK_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 \
+              && [ "${{ inputs.force }}" != "true" ]; then
             echo "Fork is already up to date."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "fork_tag=$FORK_TAG" >> "$GITHUB_OUTPUT"
+          echo "rev=$REV" >> "$GITHUB_OUTPUT"
 
       - name: Get upstream source at release tag
         if: steps.upstream.outputs.skip == 'false'
@@ -62,6 +69,14 @@ jobs:
           set -euo pipefail
           git -C upstream-src apply --stat "$GITHUB_WORKSPACE/$PATCH_FILE"
           git -C upstream-src apply "$GITHUB_WORKSPACE/$PATCH_FILE"
+
+      - name: Set fork version
+        if: steps.upstream.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          BASE="$(sed -n 's/^version *= *//p' upstream-src/gradle.properties)"
+          sed -i "s/^version *=.*/version = $BASE.${{ steps.upstream.outputs.rev }}/" upstream-src/gradle.properties
+          grep '^version' upstream-src/gradle.properties
 
       - name: Setup Java
         if: steps.upstream.outputs.skip == 'false'
@@ -99,7 +114,7 @@ jobs:
         if: steps.upstream.outputs.skip == 'false'
         run: |
           set -euo pipefail
-          TAG="${{ steps.upstream.outputs.tag }}"
+          TAG="${{ steps.upstream.outputs.fork_tag }}"
           if [ "${{ inputs.force }}" = "true" ]; then
             gh release delete "$TAG" --repo "${{ github.repository }}" --yes || true
             git push origin ":refs/tags/$TAG" || true
@@ -107,7 +122,7 @@ jobs:
           gh release create "$TAG" "$MPP" \
             --repo "${{ github.repository }}" \
             --title "patches-$VERSION" \
-            --notes "Upstream $TAG with local fixes applied. See fork-patches/."
+            --notes "Upstream ${{ steps.upstream.outputs.tag }} with local fixes applied. See fork-patches/."
 
       - name: Update patch source feed
         if: steps.upstream.outputs.skip == 'false'
@@ -117,7 +132,7 @@ jobs:
           jq -n \
             --arg created_at "$CREATED_AT" \
             --arg description "Breal Morphe Patches $VERSION with local media loading fixes for Boost for Reddit." \
-            --arg download_url "https://github.com/${{ github.repository }}/releases/download/${{ steps.upstream.outputs.tag }}/patches-$VERSION.mpp" \
+            --arg download_url "https://github.com/${{ github.repository }}/releases/download/${{ steps.upstream.outputs.fork_tag }}/patches-$VERSION.mpp" \
             --arg version "$VERSION" \
             '{created_at: $created_at, description: $description, download_url: $download_url, version: $version}' \
             > patches-bundle.json
