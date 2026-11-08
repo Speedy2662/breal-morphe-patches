@@ -1,17 +1,18 @@
 diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/FixRedgifsApiPatch.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/FixRedgifsApiPatch.java
-index dab8d39..b62da79 100644
+index dab8d39..c71f878 100644
 --- a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/FixRedgifsApiPatch.java
 +++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/FixRedgifsApiPatch.java
-@@ -7,6 +7,8 @@
+@@ -7,6 +7,9 @@
  
  package app.morphe.extension.boostforreddit;
  
 +import java.util.concurrent.TimeUnit;
 +
++import app.morphe.extension.boostforreddit.http.redgifs.RedgifsAudioUrlInterceptor;
  import app.morphe.extension.shared.fixes.redgifs.BaseFixRedgifsApiPatch;
  import okhttp3.OkHttpClient;
  
-@@ -18,12 +20,44 @@ public class FixRedgifsApiPatch extends BaseFixRedgifsApiPatch {
+@@ -18,12 +21,45 @@ public class FixRedgifsApiPatch extends BaseFixRedgifsApiPatch {
          INSTANCE = new FixRedgifsApiPatch();
      }
  
@@ -47,6 +48,7 @@ index dab8d39..b62da79 100644
 +                // configured on it are gone and have to be re-established here.
 +                client = new OkHttpClient.Builder()
 +                        .addInterceptor(INSTANCE)
++                        .addInterceptor(new RedgifsAudioUrlInterceptor())
 +                        .connectTimeout(10, TimeUnit.SECONDS)
 +                        .readTimeout(20, TimeUnit.SECONDS)
 +                        .writeTimeout(10, TimeUnit.SECONDS)
@@ -58,10 +60,21 @@ index dab8d39..b62da79 100644
      }
  }
 diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/OkHttpRequestHook.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/OkHttpRequestHook.java
-index 9bf9665..278967d 100644
+index 9bf9665..f5ea72e 100644
 --- a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/OkHttpRequestHook.java
 +++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/OkHttpRequestHook.java
-@@ -20,6 +20,7 @@ import app.morphe.extension.boostforreddit.http.wayback.WaybackThrottlingInterce
+@@ -11,15 +11,18 @@ import java.util.List;
+ 
+ import app.morphe.extension.boostforreddit.http.arcticshift.ArcticShiftThrottlingInterceptor;
+ import app.morphe.extension.boostforreddit.http.imgur.ImgurUndeleteInterceptor;
++import app.morphe.extension.boostforreddit.http.reddit.RedditBlockedEndpointsFallbackInterceptor;
+ import app.morphe.extension.boostforreddit.http.reddit.RedditFixAudioInDownloadsInterceptor;
+ import app.morphe.extension.boostforreddit.http.reddit.RedditMediaUndeleteInterceptor;
+ import app.morphe.extension.boostforreddit.http.reddit.RedditSubmissionUndeleteInterceptor;
+ import app.morphe.extension.boostforreddit.http.reddit.RedditSubredditUndeleteInterceptor;
++import app.morphe.extension.boostforreddit.http.redgifs.RedgifsAudioUrlInterceptor;
+ import app.morphe.extension.boostforreddit.http.redgifs.RedgifsUrlSanitizerInterceptor;
+ import app.morphe.extension.boostforreddit.http.wayback.WaybackThrottlingInterceptor;
  import app.morphe.extension.shared.fixes.feed.RAllPatch;
  import app.morphe.extension.shared.requests.BaseOkHttpRequestHook;
  import okhttp3.Interceptor;
@@ -69,7 +82,7 @@ index 9bf9665..278967d 100644
  
  
  /**
-@@ -35,6 +36,11 @@ public class OkHttpRequestHook extends BaseOkHttpRequestHook {
+@@ -35,10 +38,17 @@ public class OkHttpRequestHook extends BaseOkHttpRequestHook {
      }
  
  
@@ -81,6 +94,12 @@ index 9bf9665..278967d 100644
      @Override
      protected List<Interceptor> getInterceptors() {
          return List.of(
++                new RedditBlockedEndpointsFallbackInterceptor(),
+                 new RedgifsUrlSanitizerInterceptor(),
++                new RedgifsAudioUrlInterceptor(),
+                 new RedditMediaUndeleteInterceptor(),
+                 new RedditSubmissionUndeleteInterceptor(),
+                 new RedditSubredditUndeleteInterceptor(),
 diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/ReuseHttpConnectionsPatch.java
 new file mode 100644
 index 0000000..4f81d10
@@ -126,6 +145,543 @@ index 0000000..4f81d10
 +    }
 +
 +    private ReuseHttpConnectionsPatch() {}
++}
+diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/reddit/RedditBlockedEndpointsFallbackInterceptor.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/reddit/RedditBlockedEndpointsFallbackInterceptor.java
+new file mode 100644
+index 0000000..b4aeace
+--- /dev/null
++++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/reddit/RedditBlockedEndpointsFallbackInterceptor.java
+@@ -0,0 +1,453 @@
++package app.morphe.extension.boostforreddit.http.reddit;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.node.ArrayNode;
++import com.fasterxml.jackson.databind.node.JsonNodeFactory;
++import com.fasterxml.jackson.databind.node.ObjectNode;
++import com.fasterxml.jackson.databind.node.TextNode;
++
++import org.jetbrains.annotations.NotNull;
++
++import java.io.IOException;
++import java.lang.reflect.Field;
++import java.lang.reflect.Modifier;
++import java.net.URLDecoder;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.regex.Pattern;
++
++import app.morphe.extension.boostforreddit.http.HttpUtils;
++import app.morphe.extension.boostforreddit.utils.LoggingUtils;
++import okhttp3.FormBody;
++import okhttp3.HttpUrl;
++import okhttp3.Interceptor;
++import okhttp3.MediaType;
++import okhttp3.Request;
++import okhttp3.RequestBody;
++import okhttp3.Response;
++import okhttp3.ResponseBody;
++
++/**
++ * Reddit answers /api/morechildren, /api/info and /by_id with 403 for many third-party
++ * clients. When that happens, rebuild the answer from /comments/<post>, which still works.
++ *
++ * <p>More children are returned flattened in pre-order, as JRAW expects. Only subtrees whose
++ * root is a direct child of the row's parent are returned; ids that could not be loaded go
++ * back as a new "more" row.
++ */
++public class RedditBlockedEndpointsFallbackInterceptor implements Interceptor {
++    private static final Pattern REDDIT_HOST = Pattern.compile("(^|\\.)reddit\\.com$");
++    private static final Pattern MORE_CHILDREN_PATH = Pattern.compile("^/api/morechildren(\\.json)?/?$");
++    private static final Pattern INFO_PATH = Pattern.compile("^/api/info(\\.json)?/?$");
++    private static final Pattern BY_ID_PATH = Pattern.compile("^/by_id/([^/]+?)(\\.json)?/?$");
++
++    private static final int MAX_REQUESTS = 10;
++    private static final int MAX_POSTS = 25;
++
++    private static final JsonNodeFactory JSON = JsonNodeFactory.instance;
++
++    public static boolean isPatchIncluded() {
++        // Overridden by patch.
++        return false;
++    }
++
++    @NotNull
++    @Override
++    public Response intercept(@NotNull Chain chain) throws IOException {
++        Request request = chain.request();
++        if (!isPatchIncluded()) {
++            return chain.proceed(request);
++        }
++
++        HttpUrl url = request.url();
++        if (!REDDIT_HOST.matcher(url.host()).find()) {
++            return chain.proceed(request);
++        }
++
++        String path = url.encodedPath();
++        boolean moreChildren = MORE_CHILDREN_PATH.matcher(path).matches();
++        boolean postsById = INFO_PATH.matcher(path).matches() || BY_ID_PATH.matcher(path).matches();
++        if (!moreChildren && !postsById) {
++            return chain.proceed(request);
++        }
++
++        Response original = chain.proceed(request);
++        if (original.code() != 403) {
++            return original;
++        }
++
++        ResponseBody originalBody = original.body();
++        MediaType originalType = originalBody == null ? null : originalBody.contentType();
++        String originalText = originalBody == null ? "" : originalBody.string();
++        original.close();
++
++        try {
++            JsonNode rebuilt = moreChildren
++                    ? rebuildMoreChildren(chain, request)
++                    : rebuildPostsById(chain, request);
++            if (rebuilt != null) {
++                LoggingUtils.logInfo(true, () -> "Blocked endpoint fallback served " + path);
++                return HttpUtils.makeJsonResponse(request, rebuilt);
++            }
++        } catch (Exception e) {
++            LoggingUtils.logException(false, () -> "Blocked endpoint fallback failed for " + path, e);
++        }
++
++        return original.newBuilder()
++                .body(ResponseBody.create(originalText, originalType))
++                .build();
++    }
++
++    private JsonNode rebuildMoreChildren(Chain chain, Request request) throws IOException {
++        Map<String, String> args = readArguments(request);
++        String linkId = args.get("link_id");
++        String children = args.get("children");
++        if (linkId == null || !linkId.startsWith("t3_") || children == null || children.isEmpty()) {
++            return null;
++        }
++        String postId = linkId.substring(3);
++
++        List<String> requested = new ArrayList<>();
++        for (String id : children.split(",")) {
++            id = id.trim();
++            if (!id.isEmpty() && !requested.contains(id)) {
++                requested.add(id);
++            }
++        }
++        if (requested.isEmpty()) {
++            return null;
++        }
++
++        Map<String, String> query = new LinkedHashMap<>();
++        query.put("sort", args.getOrDefault("sort", "confidence"));
++        query.put("always_show_media", "1");
++        if ("true".equals(args.get("profile_img"))) {
++            query.put("profile_img", "true");
++        }
++
++        Harvest harvest = new Harvest(requested);
++        int requests = 0;
++
++        // The first comment's parent_id is the node the row hangs under.
++        JsonNode first = fetchThread(chain, request, postId, requested.get(0), query);
++        requests++;
++        if (first == null) {
++            return null;
++        }
++        harvest.collect(first);
++        harvest.missing.remove(requested.get(0));
++        String parent = harvest.parentOf.get(requested.get(0));
++        if (parent == null) {
++            return null;
++        }
++
++        if (parent.startsWith("t1_") && !harvest.missing.isEmpty()) {
++            JsonNode siblings = fetchThread(chain, request, postId, parent.substring(3), withLimit(query));
++            requests++;
++            if (siblings != null) {
++                harvest.collect(siblings);
++            }
++        }
++
++        while (!harvest.missing.isEmpty() && requests < MAX_REQUESTS) {
++            String id = harvest.missing.iterator().next();
++            JsonNode thread = fetchThread(chain, request, postId, id, query);
++            requests++;
++            if (thread == null) {
++                break;
++            }
++            harvest.collect(thread);
++            harvest.missing.remove(id);
++        }
++
++        ArrayNode things = JSON.arrayNode();
++        List<String> leftover = new ArrayList<>();
++        Set<String> emitted = new HashSet<>();
++        for (String id : requested) {
++            JsonNode comment = harvest.comments.get(id);
++            if (comment == null) {
++                if (harvest.missing.contains(id)) {
++                    leftover.add(id);
++                }
++                continue;
++            }
++            if (!parent.equals(comment.path("data").path("parent_id").asText())) {
++                continue;
++            }
++            flatten(comment, things, emitted);
++        }
++        for (String id : requested) {
++            if (!emitted.contains(id) && !leftover.contains(id) && harvest.comments.containsKey(id)
++                    && !harvest.comments.containsKey(stripPrefix(harvest.parentOf.get(id)))) {
++                leftover.add(id);
++            }
++        }
++
++        if (!leftover.isEmpty()) {
++            ObjectNode moreData = JSON.objectNode();
++            moreData.put("count", leftover.size());
++            moreData.put("name", "t1_" + leftover.get(0));
++            moreData.put("id", leftover.get(0));
++            moreData.put("parent_id", parent);
++            moreData.put("depth", 0);
++            ArrayNode ids = moreData.putArray("children");
++            for (String id : leftover) {
++                ids.add(id);
++            }
++            ObjectNode more = JSON.objectNode();
++            more.put("kind", "more");
++            more.set("data", moreData);
++            things.add(more);
++        }
++
++        if (things.size() == 0) {
++            return null;
++        }
++
++        ObjectNode data = JSON.objectNode();
++        data.set("things", things);
++        ObjectNode json = JSON.objectNode();
++        json.set("errors", JSON.arrayNode());
++        json.set("data", data);
++        ObjectNode root = JSON.objectNode();
++        root.set("json", json);
++        return root;
++    }
++
++    private static Map<String, String> withLimit(Map<String, String> query) {
++        Map<String, String> copy = new LinkedHashMap<>(query);
++        copy.put("limit", "500");
++        return copy;
++    }
++
++    private static String stripPrefix(String fullname) {
++        if (fullname == null) return "";
++        int index = fullname.indexOf('_');
++        return index < 0 ? fullname : fullname.substring(index + 1);
++    }
++
++    private static final class Harvest {
++        final Map<String, JsonNode> comments = new HashMap<>();
++        final Map<String, String> parentOf = new HashMap<>();
++        final Set<String> missing;
++
++        Harvest(List<String> requested) {
++            missing = new LinkedHashSet<>(requested);
++        }
++
++        void collect(JsonNode thread) {
++            if (thread == null || !thread.isArray() || thread.size() < 2) return;
++            walk(thread.get(1));
++        }
++
++        private void walk(JsonNode listing) {
++            JsonNode children = listing == null ? null : listing.path("data").get("children");
++            if (children == null || !children.isArray()) return;
++            for (JsonNode child : children) {
++                if (!"t1".equals(child.path("kind").asText())) continue;
++                JsonNode data = child.get("data");
++                if (data == null) continue;
++                String id = data.path("id").asText(null);
++                if (id == null) continue;
++                comments.putIfAbsent(id, child);
++                parentOf.putIfAbsent(id, data.path("parent_id").asText(null));
++                missing.remove(id);
++                JsonNode replies = data.get("replies");
++                if (replies != null && replies.isObject()) {
++                    walk(replies);
++                }
++            }
++        }
++    }
++
++    private static void flatten(JsonNode comment, ArrayNode out, Set<String> emitted) {
++        JsonNode data = comment.get("data");
++        String id = data.path("id").asText();
++        if (!emitted.add(id)) return;
++
++        ObjectNode flatData = data.deepCopy();
++        flatData.set("replies", new TextNode(""));
++        ObjectNode flat = JSON.objectNode();
++        flat.put("kind", "t1");
++        flat.set("data", flatData);
++        out.add(flat);
++
++        JsonNode replies = data.get("replies");
++        if (replies == null || !replies.isObject()) return;
++        JsonNode children = replies.path("data").get("children");
++        if (children == null || !children.isArray()) return;
++        List<JsonNode> mores = new ArrayList<>();
++        for (JsonNode child : children) {
++            String kind = child.path("kind").asText();
++            if ("t1".equals(kind)) {
++                flatten(child, out, emitted);
++            } else if ("more".equals(kind)) {
++                mores.add(child);
++            }
++        }
++        for (JsonNode more : mores) {
++            out.add(more);
++        }
++    }
++
++    private JsonNode rebuildPostsById(Chain chain, Request request) throws IOException {
++        HttpUrl url = request.url();
++        List<String> fullnames = new ArrayList<>();
++        java.util.regex.Matcher byId = BY_ID_PATH.matcher(url.encodedPath());
++        String ids = byId.matches() ? byId.group(1) : url.queryParameter("id");
++        if (ids == null) {
++            Map<String, String> args = readArguments(request);
++            ids = args.get("id");
++        }
++        if (ids == null) return null;
++        for (String name : URLDecoder.decode(ids, "UTF-8").split(",")) {
++            name = name.trim();
++            if (name.isEmpty()) continue;
++            if (!name.startsWith("t3_")) {
++                return null;
++            }
++            fullnames.add(name);
++        }
++        if (fullnames.isEmpty() || fullnames.size() > MAX_POSTS) {
++            return null;
++        }
++
++        Map<String, String> query = new LinkedHashMap<>();
++        query.put("limit", "1");
++        query.put("depth", "1");
++        query.put("always_show_media", "1");
++        String srDetail = url.queryParameter("sr_detail");
++        if (srDetail != null) query.put("sr_detail", srDetail);
++
++        ArrayNode posts = JSON.arrayNode();
++        for (String name : fullnames) {
++            JsonNode thread = fetchThread(chain, request, name.substring(3), null, query);
++            if (thread == null) {
++                return null;
++            }
++            JsonNode post = thread.path(0).path("data").path("children").path(0);
++            if (post.isObject()) {
++                posts.add(post);
++            }
++        }
++
++        ObjectNode data = JSON.objectNode();
++        data.put("modhash", "");
++        data.set("dist", JSON.numberNode(posts.size()));
++        data.set("children", posts);
++        data.set("after", JSON.nullNode());
++        data.set("before", JSON.nullNode());
++        ObjectNode listing = JSON.objectNode();
++        listing.put("kind", "Listing");
++        listing.set("data", data);
++        return listing;
++    }
++
++    private static JsonNode fetchThread(Chain chain, Request original, String postId, String focus,
++                                        Map<String, String> query) throws IOException {
++        HttpUrl.Builder url = original.url().newBuilder()
++                .encodedPath("/comments/" + postId)
++                .query(null);
++        if (focus != null) {
++            url.addQueryParameter("comment", focus);
++        }
++        for (Map.Entry<String, String> entry : query.entrySet()) {
++            url.addQueryParameter(entry.getKey(), entry.getValue());
++        }
++        String rawJson = original.url().queryParameter("raw_json");
++        if (rawJson != null) {
++            url.addQueryParameter("raw_json", rawJson);
++        }
++
++        Request request = original.newBuilder()
++                .url(url.build())
++                .get()
++                .removeHeader("Content-Type")
++                .removeHeader("Content-Length")
++                .build();
++
++        try (Response response = chain.proceed(request)) {
++            if (!response.isSuccessful() || response.body() == null) {
++                LoggingUtils.logInfo(false, () -> "Fallback request " + request.url().encodedPath()
++                        + " returned " + response.code());
++                return null;
++            }
++            String body = response.body().string();
++            if (body.isEmpty() || (body.charAt(0) != '[' && body.charAt(0) != '{')) {
++                return null;
++            }
++            return HttpUtils.getJsonFromString(body);
++        }
++    }
++
++    private static Map<String, String> readArguments(Request request) {
++        Map<String, String> args = new LinkedHashMap<>();
++        HttpUrl url = request.url();
++        for (String name : url.queryParameterNames()) {
++            args.put(name, url.queryParameter(name));
++        }
++
++        RequestBody body = request.body();
++        if (body == null) {
++            return args;
++        }
++        if (body instanceof FormBody) {
++            FormBody form = (FormBody) body;
++            for (int i = 0; i < form.size(); i++) {
++                args.put(form.name(i), form.value(i));
++            }
++            return args;
++        }
++
++        // okio is obfuscated in Boost, so read JRAW's wrapped form bytes instead of writeTo().
++        byte[] content = findBytes(body, 0, new HashSet<>());
++        if (content == null) {
++            return args;
++        }
++        String form = new String(content, StandardCharsets.UTF_8);
++        for (String pair : form.split("&")) {
++            int eq = pair.indexOf('=');
++            if (eq <= 0) continue;
++            try {
++                args.put(URLDecoder.decode(pair.substring(0, eq), "UTF-8"),
++                        URLDecoder.decode(pair.substring(eq + 1), "UTF-8"));
++            } catch (Exception ignored) {
++            }
++        }
++        return args;
++    }
++
++    private static byte[] findBytes(Object object, int depth, Set<Object> seen) {
++        if (object == null || depth > 3 || !seen.add(object)) return null;
++        for (Class<?> type = object.getClass(); type != null && type != Object.class; type = type.getSuperclass()) {
++            for (Field field : type.getDeclaredFields()) {
++                if (Modifier.isStatic(field.getModifiers()) || field.getType().isPrimitive()) continue;
++                try {
++                    field.setAccessible(true);
++                    Object value = field.get(object);
++                    if (value instanceof byte[]) {
++                        return (byte[]) value;
++                    }
++                    if (value instanceof String && ((String) value).contains("children=")) {
++                        return ((String) value).getBytes(StandardCharsets.UTF_8);
++                    }
++                    if (value != null && !(value instanceof String) && !(value instanceof Number)
++                            && !value.getClass().getName().startsWith("java.")) {
++                        byte[] nested = findBytes(value, depth + 1, seen);
++                        if (nested != null) return nested;
++                    }
++                } catch (Throwable ignored) {
++                }
++            }
++        }
++        return null;
++    }
++
++}
+diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/redgifs/RedgifsAudioUrlInterceptor.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/redgifs/RedgifsAudioUrlInterceptor.java
+new file mode 100644
+index 0000000..187b690
+--- /dev/null
++++ b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/http/redgifs/RedgifsAudioUrlInterceptor.java
+@@ -0,0 +1,72 @@
++package app.morphe.extension.boostforreddit.http.redgifs;
++
++import androidx.annotation.NonNull;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.node.ObjectNode;
++
++import java.io.IOException;
++
++import app.morphe.extension.boostforreddit.http.HttpUtils;
++import app.morphe.extension.shared.Logger;
++import okhttp3.Interceptor;
++import okhttp3.MediaType;
++import okhttp3.Request;
++import okhttp3.Response;
++import okhttp3.ResponseBody;
++
++/**
++ * The Redgifs API now lists a {@code silent} mp4 (no audio track) ahead of {@code hd} and
++ * {@code sd} in each gif's {@code urls}. Point it at the file with audio so Boost plays sound
++ * whichever entry it picks.
++ */
++public class RedgifsAudioUrlInterceptor implements Interceptor {
++
++    @NonNull
++    @Override
++    public Response intercept(@NonNull Chain chain) throws IOException {
++        Request request = chain.request();
++        Response response = chain.proceed(request);
++
++        if (!request.url().host().equals("api.redgifs.com")
++                || !request.url().encodedPath().startsWith("/v2/")
++                || !response.isSuccessful()) {
++            return response;
++        }
++        ResponseBody body = response.body();
++        MediaType type = body == null ? null : body.contentType();
++        if (type == null || !"json".equals(type.subtype())) {
++            return response;
++        }
++
++        String text = body.string();
++        try {
++            JsonNode json = HttpUtils.getJsonFromString(text);
++            if (fixUrls(json)) {
++                text = HttpUtils.getStringFromJson(json);
++            }
++        } catch (RuntimeException e) {
++            Logger.printException(() -> "Could not rewrite Redgifs urls", e);
++        }
++        return response.newBuilder().body(ResponseBody.create(text, type)).build();
++    }
++
++    static boolean fixUrls(JsonNode node) {
++        boolean changed = false;
++        if (node.isObject()) {
++            JsonNode urls = node.get("urls");
++            if (urls instanceof ObjectNode && urls.has("silent")
++                    && node.path("hasAudio").asBoolean(true)) {
++                JsonNode withAudio = urls.hasNonNull("hd") ? urls.get("hd") : urls.get("sd");
++                if (withAudio != null && withAudio.isTextual()) {
++                    ((ObjectNode) urls).set("silent", withAudio);
++                    changed = true;
++                }
++            }
++        }
++        for (JsonNode child : node) {
++            changed |= fixUrls(child);
++        }
++        return changed;
++    }
 +}
 diff --git a/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java b/extensions/boostforreddit/src/main/java/app/morphe/extension/boostforreddit/video/VideoResumePatch.java
 new file mode 100644
@@ -462,10 +1018,18 @@ index 7b8b2ec..fbdfcd1 100644
              builder.addInterceptor(interceptor);
          }
 diff --git a/patches/api/patches.api b/patches/api/patches.api
-index a4fb681..a592438 100644
+index a4fb681..8c3a277 100644
 --- a/patches/api/patches.api
 +++ b/patches/api/patches.api
-@@ -106,6 +106,10 @@ public final class app/morphe/patches/reddit/customclients/boostforreddit/http/i
+@@ -102,10 +102,18 @@ public final class app/morphe/patches/reddit/customclients/boostforreddit/http/a
+ 	public static final fun getAddArchiveLinks ()Lapp/morphe/patcher/patch/BytecodePatch;
+ }
+ 
++public final class app/morphe/patches/reddit/customclients/boostforreddit/http/blocked/FixBlockedRedditEndpointsPatchKt {
++	public static final fun getFixBlockedRedditEndpoints ()Lapp/morphe/patcher/patch/BytecodePatch;
++}
++
+ public final class app/morphe/patches/reddit/customclients/boostforreddit/http/imgur/UndeleteImgurPatchKt {
  	public static final fun getInterceptImgurRequests ()Lapp/morphe/patcher/patch/BytecodePatch;
  }
  
@@ -476,7 +1040,7 @@ index a4fb681..a592438 100644
  public final class app/morphe/patches/reddit/customclients/boostforreddit/http/reddit/UndeleteRedditPatchKt {
  	public static final fun getUndeleteRedditPatch ()Lapp/morphe/patcher/patch/BytecodePatch;
  }
-@@ -114,6 +118,10 @@ public final class app/morphe/patches/reddit/customclients/boostforreddit/misc/e
+@@ -114,6 +122,10 @@ public final class app/morphe/patches/reddit/customclients/boostforreddit/misc/e
  	public static final fun getSharedExtensionPatch ()Lapp/morphe/patcher/patch/BytecodePatch;
  }
  
@@ -487,6 +1051,38 @@ index a4fb681..a592438 100644
  public final class app/morphe/patches/reddit/customclients/continuum/api/SpoofClientPatchKt {
  	public static final fun getSpoofClientPatch ()Lapp/morphe/patcher/patch/BytecodePatch;
  }
+diff --git a/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/blocked/FixBlockedRedditEndpointsPatch.kt b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/blocked/FixBlockedRedditEndpointsPatch.kt
+new file mode 100644
+index 0000000..528b173
+--- /dev/null
++++ b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/blocked/FixBlockedRedditEndpointsPatch.kt
+@@ -0,0 +1,26 @@
++package app.morphe.patches.reddit.customclients.boostforreddit.http.blocked
++
++import app.morphe.patcher.Fingerprint
++import app.morphe.patcher.patch.bytecodePatch
++import app.morphe.patches.reddit.customclients.boostforreddit.BoostCompatible
++import app.morphe.patches.reddit.customclients.boostforreddit.http.interceptHttpRequests
++import app.morphe.patches.reddit.customclients.boostforreddit.misc.extension.sharedExtensionPatch
++import app.morphe.util.returnEarly
++
++@Suppress("unused")
++val fixBlockedRedditEndpoints = bytecodePatch(
++    name = "Fix blocked Reddit endpoints",
++    description = "Fixes \"more replies\" failing with 403 Blocked. " +
++        "Reddit now blocks /api/morechildren, /api/info and /by_id for many third-party clients; " +
++        "when that happens, the same comments and posts are loaded from the comment thread endpoint instead.",
++) {
++    dependsOn(interceptHttpRequests, sharedExtensionPatch)
++    compatibleWith(*BoostCompatible)
++
++    execute {
++        Fingerprint(
++            definingClass = "Lapp/morphe/extension/boostforreddit/http/reddit/RedditBlockedEndpointsFallbackInterceptor;",
++            name = "isPatchIncluded",
++        ).method.returnEarly(true)
++    }
++}
 diff --git a/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/pool/ReuseHttpConnectionsPatch.kt b/patches/src/main/kotlin/app/morphe/patches/reddit/customclients/boostforreddit/http/pool/ReuseHttpConnectionsPatch.kt
 new file mode 100644
 index 0000000..086dab7
